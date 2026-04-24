@@ -59,8 +59,8 @@ static const char *TAG = "SMART_STUDY";
 #define SERVER_URL  "https://web-study-lamp.onrender.com"
 
 /* Pomodoro */
-#define POMODORO_WORK_MS    (25 * 60 * 1000)
-#define POMODORO_BREAK_MS   (5  * 60 * 1000)
+static volatile uint32_t g_work_min  = 25;
+static volatile uint32_t g_break_min = 5;
 
 /* ============================================================
  *  MACRO BCD — FIX: thêm ngoặc bảo vệ argument
@@ -81,9 +81,16 @@ typedef enum {
     WEB_CMD_STOP,
     WEB_CMD_RESET,
     WEB_CMD_COLOR,
+    WEB_CMD_SET_TIME,   // <-- Lệnh cài Pomodoro mới
+    WEB_CMD_SET_RTC     // <-- Lệnh cài RTC mới
 } web_cmd_t;
 
-typedef struct { web_cmd_t cmd; uint8_t r, g, b; } web_ctrl_t;
+typedef struct { 
+    web_cmd_t cmd; 
+    uint8_t r, g, b; 
+    uint16_t work_min, break_min;               // Chứa phút học/nghỉ
+    uint8_t hour, min, sec, date, month, year;  // Chứa giờ RTC
+} web_ctrl_t;
 typedef struct { uint8_t r, g, b, brightness; } led_cmd_t;
 
 typedef struct {
@@ -446,12 +453,13 @@ void task_logic(void *pv) {
 
     while (1) {
         /* ---- 1. Lệnh nút nhấn ---- */
+        /* ---- 1. Lệnh nút nhấn ---- */
         if (xQueueReceive(Queue_Command, &cmd, 0) == pdTRUE) {
             switch (cmd) {
                 case CMD_START:
                     if (state == STATE_IDLE || state == STATE_BREAK) {
                         state = STATE_WORK;
-                        remain_sec = POMODORO_WORK_MS / 1000;
+                        remain_sec = g_work_min * 60; // ĐÃ SỬA THÀNH BIẾN MỚI
                         ESP_LOGI("LOGIC", "BTN -> WORK");
                     } else if (state == STATE_PAUSE) {
                         state = STATE_WORK;
@@ -480,7 +488,7 @@ void task_logic(void *pv) {
                 case WEB_CMD_START:
                     if (state == STATE_IDLE || state == STATE_BREAK) {
                         state = STATE_WORK;
-                        remain_sec = POMODORO_WORK_MS / 1000;
+                        remain_sec = g_work_min * 60; // ĐÃ SỬA THÀNH BIẾN MỚI
                         ESP_LOGI("LOGIC", "WEB -> WORK");
                     } else if (state == STATE_PAUSE) {
                         state = STATE_WORK;
@@ -507,6 +515,26 @@ void task_logic(void *pv) {
                     g_manual_b = wctrl.b;
                     ESP_LOGI("LOGIC", "WEB -> COLOR R=%d G=%d B=%d",
                              wctrl.r, wctrl.g, wctrl.b);
+                    break; // <--- VỪA THÊM CHỮ BREAK VÀO ĐÂY ĐỂ TRÁNH LỖI!
+                
+                case WEB_CMD_SET_TIME:
+                    g_work_min  = wctrl.work_min;
+                    g_break_min = wctrl.break_min;
+                    ESP_LOGI("LOGIC", "SET_TIME: Work=%dp, Break=%dp", (int)g_work_min, (int)g_break_min);
+                    if (state == STATE_IDLE) remain_sec = 0; 
+                    break;
+
+                case WEB_CMD_SET_RTC:
+                    if (xSemaphoreTake(Mutex_I2C, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        rtc_time_t new_rtc = {
+                            .hour = wctrl.hour, .min = wctrl.min, .sec = wctrl.sec,
+                            .date = wctrl.date, .month = wctrl.month, .year = wctrl.year,
+                            .day  = 1 
+                        };
+                        ds3231_set_time(&new_rtc);
+                        xSemaphoreGive(Mutex_I2C);
+                        ESP_LOGI("LOGIC", "SET_RTC Tu Web OK!");
+                    }
                     break;
                 default: break;
             }
@@ -526,7 +554,7 @@ if (xQueueReceive(Queue_Sensor, &lux_val, 0) == pdTRUE) {
      */
 }
 
-        /* ---- 4. Đếm ngược 1 giây ---- */
+       /* ---- 4. Đếm ngược 1 giây ---- */
         TickType_t now = xTaskGetTickCount();
         if ((now - last_sec_tick) >= pdMS_TO_TICKS(1000)) {
             last_sec_tick = now;
@@ -539,7 +567,10 @@ if (xQueueReceive(Queue_Sensor, &lux_val, 0) == pdTRUE) {
                     pending_alert = ALERT_WORK_END;
                     g_sessions++;
                     state = STATE_BREAK;
-                    remain_sec = POMODORO_BREAK_MS / 1000;
+                    
+                    // SỬA Ở ĐÂY: Thay bằng biến g_break_min * 60
+                    remain_sec = g_break_min * 60; 
+                    
                     ESP_LOGI("LOGIC", "WORK_END -> BREAK");
                 } else {
                     pending_alert = ALERT_BREAK_START;
@@ -780,6 +811,25 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 ctrl.r = (uint8_t)(r & 0xFF);
                 ctrl.g = (uint8_t)(g & 0xFF);
                 ctrl.b = (uint8_t)(b & 0xFF);
+            }
+            else if (strstr(resp, "\"SET_TIME\"")) {
+                ctrl.cmd = WEB_CMD_SET_TIME;
+                int w = 25, b = 5;
+                char *pw = strstr(resp, "\"work\":");  if (pw) sscanf(pw+7, "%d", &w);
+                char *pb = strstr(resp, "\"break\":"); if (pb) sscanf(pb+8, "%d", &b);
+                ctrl.work_min = (uint16_t)w; ctrl.break_min = (uint16_t)b;
+            }
+            else if (strstr(resp, "\"SET_RTC\"")) {
+                ctrl.cmd = WEB_CMD_SET_RTC;
+                int h=0, m=0, s=0, d=1, mo=1, y=0;
+                char *ph = strstr(resp, "\"hour\":");  if (ph) sscanf(ph+7, "%d", &h);
+                char *pm = strstr(resp, "\"min\":");   if (pm) sscanf(pm+6, "%d", &m);
+                char *ps = strstr(resp, "\"sec\":");   if (ps) sscanf(ps+6, "%d", &s);
+                char *pd = strstr(resp, "\"date\":");  if (pd) sscanf(pd+7, "%d", &d);
+                char *pmo= strstr(resp, "\"month\":"); if (pmo) sscanf(pmo+8, "%d", &mo);
+                char *py = strstr(resp, "\"year\":");  if (py) sscanf(py+7, "%d", &y);
+                ctrl.hour = h; ctrl.min = m; ctrl.sec = s; 
+                ctrl.date = d; ctrl.month = mo; ctrl.year = y;
             }
             if (ctrl.cmd != WEB_CMD_NONE) {
                 ESP_LOGI("MQTT", "Thuc thi: cmd=%d r=%d g=%d b=%d", ctrl.cmd, ctrl.r, ctrl.g, ctrl.b);
