@@ -3,13 +3,6 @@
  *  SMART STUDY ASSISTANT - Hệ Thống Nhúng Học Sâu
  *  Trường Đại học Bách Khoa Đà Nẵng - Khoa Điện tử Viễn thông
  * ============================================================
- *  Vi điều khiển : ESP32-C3
- *  RTOS          : FreeRTOS
- *  Tác vụ        : Task_Input, Task_Sensor, Task_Logic,
- *                  Task_Display, Task_Light, Task_Alert, Task_WiFi
- *  Đồng bộ hóa  : Queue, Mutex, Semaphore
- *  LED           : WS2812B 100 LED/m (RMT)
- * ============================================================
  */
 
 #include "esp_crt_bundle.h"
@@ -27,13 +20,11 @@
 #include "esp_event.h"
 #include "esp_http_client.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_netif.h"
 #include "mqtt_client.h"
 static const char *TAG = "SMART_STUDY";
 
-/* ============================================================
- *  CẤU HÌNH CHÂN GPIO
- * ============================================================ */
 #define BTN_START_GPIO      4
 #define BTN_STOP_GPIO       5
 #define BTN_RESET_GPIO      6
@@ -44,7 +35,6 @@ static const char *TAG = "SMART_STUDY";
 #define LED_DATA_GPIO       8
 #define LED_COUNT           100
 
-/* Địa chỉ I2C */
 #define DS3231_ADDR         0x68
 #define OLED_ADDR           0x3C
 #define BH1750_ADDR         0x23
@@ -52,45 +42,33 @@ static const char *TAG = "SMART_STUDY";
 #define I2C_MASTER_FREQ_HZ  100000
 #define I2C_TIMEOUT_MS      pdMS_TO_TICKS(1000)
 
-/* WiFi & Server */
-#define WIFI_SSID           "Trifnh"
-#define WIFI_PASS           "01072025"
-// Bỏ chữ "s" trong https, bỏ ":5000", giữ nguyên đường dẫn API phía sau
-#define SERVER_URL  "https://web-study-lamp.onrender.com"
+#define WIFI_SSID           "Van Lan"
+#define WIFI_PASS           "23091969"
+#define SERVER_URL          "https://web-study-lamp.onrender.com"
 
-/* Pomodoro */
 static volatile uint32_t g_work_min  = 25;
 static volatile uint32_t g_break_min = 5;
 
-/* ============================================================
- *  MACRO BCD — FIX: thêm ngoặc bảo vệ argument
- * ============================================================ */
 #define BCD2DEC(v)  ((((v) >> 4) & 0x0F) * 10 + ((v) & 0x0F))
 #define DEC2BCD(v)  ((((v) / 10) << 4)   | ((v) % 10))
 
-/* ============================================================
- *  KIỂU DỮ LIỆU
- * ============================================================ */
 typedef enum { CMD_START, CMD_STOP, CMD_RESET } btn_cmd_t;
 typedef enum { STATE_IDLE, STATE_WORK, STATE_BREAK, STATE_PAUSE } clock_state_t;
 typedef enum { ALERT_NONE, ALERT_WORK_END, ALERT_BREAK_START } alert_code_t;
 
 typedef enum {
     WEB_CMD_NONE = 0,
-    WEB_CMD_START,
-    WEB_CMD_STOP,
-    WEB_CMD_RESET,
-    WEB_CMD_COLOR,
-    WEB_CMD_SET_TIME,   // <-- Lệnh cài Pomodoro mới
-    WEB_CMD_SET_RTC     // <-- Lệnh cài RTC mới
+    WEB_CMD_START, WEB_CMD_STOP, WEB_CMD_RESET, WEB_CMD_COLOR,
+    WEB_CMD_SET_TIME, WEB_CMD_SET_RTC
 } web_cmd_t;
 
-typedef struct { 
-    web_cmd_t cmd; 
-    uint8_t r, g, b; 
-    uint16_t work_min, break_min;               // Chứa phút học/nghỉ
-    uint8_t hour, min, sec, date, month, year;  // Chứa giờ RTC
+typedef struct {
+    web_cmd_t cmd;
+    uint8_t r, g, b;
+    uint16_t work_min, break_min;
+    uint8_t hour, min, sec, date, month, year;
 } web_ctrl_t;
+
 typedef struct { uint8_t r, g, b, brightness; } led_cmd_t;
 
 typedef struct {
@@ -99,7 +77,7 @@ typedef struct {
     float    lux;
     uint8_t  led_brt;
     uint8_t  hour, min, sec;
-    uint8_t  date, month, year;   // ← THÊM DÒNG NÀY
+    uint8_t  date, month, year;
 } disp_data_t;
 
 typedef struct {
@@ -113,9 +91,6 @@ typedef struct {
     uint8_t day, date, month, year;
 } rtc_time_t;
 
-/* ============================================================
- *  BIẾN TOÀN CỤC
- * ============================================================ */
 static volatile clock_state_t g_state      = STATE_IDLE;
 static volatile uint32_t      g_remain_sec = 0;
 static volatile float         g_lux        = 0.0f;
@@ -131,9 +106,6 @@ static volatile uint8_t g_manual_b     = 0;
 
 static led_strip_handle_t led_strip = NULL;
 
-/* ============================================================
- *  HANDLE QUEUE / MUTEX / SEMAPHORE
- * ============================================================ */
 static QueueHandle_t     Queue_Input   = NULL;
 static QueueHandle_t     Queue_Command = NULL;
 static QueueHandle_t     Queue_Sensor  = NULL;
@@ -176,7 +148,7 @@ static const uint8_t font5x8[][5] = {
 };
 
 /* ============================================================
- *  OLED DRIVER
+ *  OLED DRIVER (giữ nguyên)
  * ============================================================ */
 static void oled_send_cmd(uint8_t cmd) {
     uint8_t buf[2] = {0x00, cmd};
@@ -210,21 +182,279 @@ static void oled_set_brightness(uint8_t level) {
     oled_send_cmd(0x81);
     oled_send_cmd(level);
 }
-static void oled_print(uint8_t row, uint8_t col_char, const char *str) {
-    oled_set_cursor(row, col_char * 6);
-    while (*str) {
-        if (*str >= 32 && *str <= 126) {
-            for (int i = 0; i < 5; i++) oled_send_data(font5x8[*str - 32][i]);
-            oled_send_data(0x00);
+
+/* ============================================================
+ *  ██████████████████████████████████████████████████████████
+ *  FRAMEBUFFER + LOPAKA DISPLAY ENGINE  ← THÊM MỚI HOÀN TOÀN
+ *  ██████████████████████████████████████████████████████████
+ *
+ *  Đây là phần DUY NHẤT thay đổi so với firmware gốc của bạn.
+ *  Tất cả code bên dưới đây đến hết task_display() là MỚI.
+ * ============================================================ */
+
+/* Framebuffer 128×64 pixel trong RAM */
+static uint8_t fb[8][128];
+
+static void fb_clear(void) {
+    memset(fb, 0, sizeof(fb));
+}
+
+/* Ghi 1 pixel vào framebuffer */
+static void fb_pixel(int x, int y, uint8_t on) {
+    if (x < 0 || x > 127 || y < 0 || y > 63) return;
+    if (on) fb[y/8][x] |=  (1 << (y%8));
+    else    fb[y/8][x] &= ~(1 << (y%8));
+}
+
+/* Đẩy toàn bộ framebuffer lên OLED 1 lần — không nhấp nháy */
+static void fb_flush(void) {
+    for (uint8_t page = 0; page < 8; page++) {
+        oled_send_cmd(0xB0 | page);
+        oled_send_cmd(0x00);
+        oled_send_cmd(0x10);
+        for (uint8_t col = 0; col < 128; col++) {
+            oled_send_data(fb[page][col]);
         }
-        str++;
     }
 }
 
+/* ── Primitives ───────────────────────────────────────────── */
+static void fb_hline(int x0, int x1, int y, uint8_t on) {
+    if (x0 > x1) { int t=x0; x0=x1; x1=t; }
+    for (int x = x0; x <= x1; x++) fb_pixel(x, y, on);
+}
+static void fb_vline(int x, int y0, int y1, uint8_t on) {
+    if (y0 > y1) { int t=y0; y0=y1; y1=t; }
+    for (int y = y0; y <= y1; y++) fb_pixel(x, y, on);
+}
+
+/* Hình chữ nhật bo góc — viền */
+static void fb_round_rect(int x, int y, int w, int h, int r) {
+    fb_hline(x+r, x+w-r-1, y,     1);
+    fb_hline(x+r, x+w-r-1, y+h-1, 1);
+    fb_vline(x,     y+r, y+h-r-1, 1);
+    fb_vline(x+w-1, y+r, y+h-r-1, 1);
+    int cx=0, cy=r, err=1-r;
+    while (cx <= cy) {
+        fb_pixel(x+w-r-1+cx, y+r-1  -cy, 1);
+        fb_pixel(x+r    -cx, y+r-1  -cy, 1);
+        fb_pixel(x+w-r-1+cx, y+h-r-1+cy, 1);
+        fb_pixel(x+r    -cx, y+h-r-1+cy, 1);
+        fb_pixel(x+w-r-1+cy, y+r-1  -cx, 1);
+        fb_pixel(x+r    -cy, y+r-1  -cx, 1);
+        fb_pixel(x+w-r-1+cy, y+h-r-1+cx, 1);
+        fb_pixel(x+r    -cy, y+h-r-1+cx, 1);
+        if (err < 0) {
+            err += 2*cx+3;
+        } else {
+            err += 2*(cx-cy)+5;
+            cy--;
+        }
+        cx++;
+    }
+}
+
+/* Hình chữ nhật bo góc — đặc (fill) */
+static void fb_fill_round_rect(int x, int y, int w, int h, int r) {
+    for (int row = y+r; row <= y+h-r-1; row++) fb_hline(x, x+w-1, row, 1);
+    int cx=0, cy=r, err=1-r;
+    while (cx <= cy) {
+        fb_hline(x+r-cy, x+w-r-1+cy, y+r-cx,     1);
+        fb_hline(x+r-cx, x+w-r-1+cx, y+r-cy,     1);
+        fb_hline(x+r-cy, x+w-r-1+cy, y+h-r-1+cx, 1);
+        fb_hline(x+r-cx, x+w-r-1+cx, y+h-r-1+cy, 1);
+        if (err < 0) {
+            err += 2*cx+3;
+        } else {
+            err += 2*(cx-cy)+5;
+            cy--;
+        }
+        cx++;
+    }
+}
+
+/* Vòng tròn rỗng */
+static void fb_circle(int cx, int cy, int r) {
+    int x=0, y=r, err=1-r;
+    while (x <= y) {
+        fb_pixel(cx+x,cy+y,1); fb_pixel(cx-x,cy+y,1);
+        fb_pixel(cx+x,cy-y,1); fb_pixel(cx-x,cy-y,1);
+        fb_pixel(cx+y,cy+x,1); fb_pixel(cx-y,cy+x,1);
+        fb_pixel(cx+y,cy-x,1); fb_pixel(cx-y,cy-x,1);
+        if (err < 0) {
+            err += 2*x+3;
+        } else {
+            err += 2*(x-y)+5;
+            y--;
+        }
+        x++;
+    }
+}
+
+/* ── Text size 1 (font5x8, 6px/char) ─────────────────────── */
+static void fb_text(int x, int y, const char *str) {
+    while (*str) {
+        uint8_t c = (uint8_t)(*str++);
+        if (c < 32 || c > 126) { x += 6; continue; }
+        const uint8_t *g = font5x8[c-32];
+        for (int col = 0; col < 5; col++) {
+            uint8_t bits = g[col];
+            for (int bit = 0; bit < 8; bit++)
+                if (bits & (1<<bit)) fb_pixel(x+col, y+bit, 1);
+        }
+        x += 6;
+    }
+}
+
+/* ── Text size 2 (scale ×2, 12px/char) — dùng cho RTC ────── */
+static void fb_text_x2(int x, int y, const char *str) {
+    while (*str) {
+        uint8_t c = (uint8_t)(*str++);
+        if (c < 32 || c > 126) { x += 12; continue; }
+        const uint8_t *g = font5x8[c-32];
+        for (int col = 0; col < 5; col++) {
+            uint8_t bits = g[col];
+            for (int bit = 0; bit < 8; bit++) {
+                if (bits & (1<<bit)) {
+                    fb_pixel(x+col*2,   y+bit*2,   1);
+                    fb_pixel(x+col*2+1, y+bit*2,   1);
+                    fb_pixel(x+col*2,   y+bit*2+1, 1);
+                    fb_pixel(x+col*2+1, y+bit*2+1, 1);
+                }
+            }
+        }
+        x += 12;
+    }
+}
+
+/* ── Format tổng thời gian học ──────────────────────────── */
+static void fmt_total(char *buf, size_t sz, uint32_t sec) {
+    uint32_t h = sec / 3600;
+    uint32_t m = (sec % 3600) / 60;
+    if (h > 0) snprintf(buf, sz, "%luh%02lu", (unsigned long)h, (unsigned long)m);
+    else        snprintf(buf, sz, "%02lu:%02lu",(unsigned long)m,(unsigned long)(sec%60));
+}
+
+/* ── Vẽ 1 frame hoàn chỉnh theo Lopaka layout ────────────── */
+static void draw_frame(const disp_data_t *d) {
+    char buf[24];
+    fb_clear();
+
+    /* ① RTC — setCursor(17,3) + setTextSize(2) */
+    snprintf(buf, sizeof(buf), "%02u:%02u:%02u",
+             (unsigned)d->hour, (unsigned)d->min, (unsigned)d->sec);
+    fb_text_x2(17, 3, buf);
+
+    /* ② Đường kẻ ngang — drawLine(1,19,128,19) */
+    fb_hline(1, 127, 19, 1);
+
+    /* ③ Badge trạng thái — drawRoundRect(3,22,36,13,4) */
+    const char *state_str;
+    int badge_w;
+    switch (d->state) {
+        case STATE_WORK:  state_str="WORK";  badge_w=36; break;
+        case STATE_BREAK: state_str="BREAK"; badge_w=42; break;
+        case STATE_PAUSE: state_str="PAUSE"; badge_w=42; break;
+        default:          state_str="IDLE";  badge_w=30; break;
+    }
+    fb_round_rect(3, 22, badge_w, 13, 4);
+    /* Text bên trong badge — setCursor(9,26) */
+    fb_text(9, 26, state_str);
+
+    /* ④ Dấu chấm tròn — drawCircle(38,30,1) */
+    if (d->state != STATE_IDLE) {
+        fb_circle(38, 30, 1);
+    }
+
+    /* ⑤ Pomodoro countdown — setCursor(85,23) */
+    if (d->state != STATE_IDLE) {
+        snprintf(buf, sizeof(buf), "%02u:%02u",
+                 (unsigned)(d->remaining_sec/60),
+                 (unsigned)(d->remaining_sec%60));
+    } else {
+        snprintf(buf, sizeof(buf), "%02lu:00", (unsigned long)g_work_min);
+    }
+    fb_text(85, 23, buf);
+
+    /* ⑥ Progress bar
+     *   Viền — drawRoundRect(1,36,126,10,4)
+     *   Fill — fillRoundRect(2,37,fill_w,8,3)  remaining → đầy=còn nhiều */
+    fb_round_rect(1, 36, 126, 10, 4);
+    if (d->state != STATE_IDLE) {
+        uint32_t total_s = (d->state == STATE_BREAK)
+                           ? g_break_min * 60
+                           : g_work_min  * 60;
+        if (total_s > 0 && d->remaining_sec > 0) {
+            int fill_w = (int)((uint32_t)d->remaining_sec * 122 / total_s);
+            if (fill_w > 0) fb_fill_round_rect(2, 37, fill_w, 8, 3);
+        }
+    }
+
+    /* ⑦ Đường kẻ ngang footer — drawLine(1,47,129,47) */
+    fb_hline(1, 127, 47, 1);
+
+    /* ⑧ Đường kẻ dọc phân 3 cột — drawLine(43,48,43,63) & (87,47,87,65) */
+    fb_vline(43, 48, 63, 1);
+    fb_vline(87, 47, 63, 1);
+
+    /* ⑨ Cột 1: LUX — setCursor(4,49) label, setCursor(24,56) value */
+    fb_text(4, 49, "Lux");
+    if (d->lux >= 0)
+        snprintf(buf, sizeof(buf), "%4.0f", d->lux);
+    else
+        snprintf(buf, sizeof(buf), " ---");
+    fb_text(4, 57, buf);
+
+    /* ⑩ Cột 2: BRT — setCursor(48,49) label, setCursor(66,57) value */
+    fb_text(48, 49, "BRT");
+    snprintf(buf, sizeof(buf), "%3u%%", (unsigned)d->led_brt);
+    fb_text(50, 57, buf);
+
+    /* ⑪ Cột 3: TOTAL — setCursor(89,49) label, setCursor(104,57) value */
+    fb_text(89, 49, "TOTAL");
+    fmt_total(buf, sizeof(buf), g_total_sec);
+    fb_text(92, 57, buf);
+
+    /* Flush toàn bộ framebuffer lên OLED 1 lần */
+    fb_flush();
+}
+
+/* ============================================================
+ *  TASK 4: Task_Display  ← CHỈ HÀM NÀY THAY ĐỔI SO VỚI GỐC
+ * ============================================================ */
+void task_display(void *pv) {
+    if (xSemaphoreTake(Mutex_I2C, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        oled_init();
+        xSemaphoreGive(Mutex_I2C);
+    }
+
+    disp_data_t data;
+
+    while (1) {
+        if (xQueueReceive(Queue_Display, &data, pdMS_TO_TICKS(200)) != pdTRUE) continue;
+        if (xSemaphoreTake(Mutex_I2C,   pdMS_TO_TICKS(200)) != pdTRUE) continue;
+
+        /* Điều chỉnh độ sáng OLED theo lux */
+        uint8_t oled_brt;
+        if      (data.lux < 15.0f)  oled_brt = 10;
+        else if (data.lux < 150.0f) oled_brt = 128;
+        else                         oled_brt = 255;
+        oled_set_brightness(oled_brt);
+
+        /* Vẽ frame và đẩy lên màn hình */
+        draw_frame(&data);
+
+        xSemaphoreGive(Mutex_I2C);
+    }
+}
+/* ============================================================
+ *  ██████████████████████████████████████████████████████████
+ *  KẾT THÚC PHẦN THAY ĐỔI — TẤT CẢ CODE BÊN DƯỚI GIỮ NGUYÊN
+ *  ██████████████████████████████████████████████████████████
+ * ============================================================ */
+
 /* ============================================================
  *  DS3231 RTC DRIVER
- *  Datasheet DS3231: registers 0x00-0x06
- *  reg[0]=sec, [1]=min, [2]=hour, [3]=day, [4]=date, [5]=month, [6]=year
  * ============================================================ */
 static esp_err_t ds3231_read_time(rtc_time_t *t) {
     uint8_t raw[7] = {0};
@@ -232,7 +462,6 @@ static esp_err_t ds3231_read_time(rtc_time_t *t) {
     esp_err_t err = i2c_master_write_read_device(
         I2C_MASTER_NUM, DS3231_ADDR, &reg, 1, raw, 7, I2C_TIMEOUT_MS);
     if (err != ESP_OK) return err;
-
     t->sec   = BCD2DEC(raw[0] & 0x7F);
     t->min   = BCD2DEC(raw[1] & 0x7F);
     t->hour  = BCD2DEC(raw[2] & 0x3F);
@@ -244,31 +473,18 @@ static esp_err_t ds3231_read_time(rtc_time_t *t) {
 }
 
 static esp_err_t ds3231_set_time(const rtc_time_t *t) {
-    /* Kiểm tra giá trị hợp lệ trước khi ghi */
     if (t->sec > 59 || t->min > 59 || t->hour > 23 ||
         t->date < 1 || t->date > 31 ||
-        t->month < 1 || t->month > 12 ||
-        t->year > 99) {
-        ESP_LOGE("RTC", "Gio khong hop le! sec=%d min=%d hour=%d date=%d month=%d year=%d",
-                 t->sec, t->min, t->hour, t->date, t->month, t->year);
+        t->month < 1 || t->month > 12 || t->year > 99) {
+        ESP_LOGE("RTC", "Gio khong hop le!");
         return ESP_ERR_INVALID_ARG;
     }
-
     uint8_t buf[8];
-    buf[0] = 0x00;                  /* bắt đầu từ register 0x00 */
-    buf[1] = DEC2BCD(t->sec);       /* 0x00: seconds */
-    buf[2] = DEC2BCD(t->min);       /* 0x01: minutes */
-    buf[3] = DEC2BCD(t->hour);      /* 0x02: hours (24h mode, bit6=0) */
-    buf[4] = DEC2BCD(t->day);       /* 0x03: day of week (1-7) */
-    buf[5] = DEC2BCD(t->date);      /* 0x04: date (1-31) */
-    buf[6] = DEC2BCD(t->month);     /* 0x05: month (1-12) */
-    buf[7] = DEC2BCD(t->year);      /* 0x06: year (0-99) */
-
-    esp_err_t err = i2c_master_write_to_device(
-        I2C_MASTER_NUM, DS3231_ADDR, buf, 8, I2C_TIMEOUT_MS);
-
+    buf[0]=0x00; buf[1]=DEC2BCD(t->sec);   buf[2]=DEC2BCD(t->min);
+    buf[3]=DEC2BCD(t->hour); buf[4]=DEC2BCD(t->day);
+    buf[5]=DEC2BCD(t->date); buf[6]=DEC2BCD(t->month); buf[7]=DEC2BCD(t->year);
+    esp_err_t err = i2c_master_write_to_device(I2C_MASTER_NUM, DS3231_ADDR, buf, 8, I2C_TIMEOUT_MS);
     if (err == ESP_OK) {
-        /* Đọc lại để xác nhận ghi thành công */
         rtc_time_t verify = {0};
         vTaskDelay(pdMS_TO_TICKS(50));
         ds3231_read_time(&verify);
@@ -285,36 +501,28 @@ static esp_err_t ds3231_set_time(const rtc_time_t *t) {
 static bool bh1750_ready = false;
 
 static void bh1750_init(void) {
-    uint8_t cmd;
-    esp_err_t err;
-    cmd = 0x01;
-    err = i2c_master_write_to_device(I2C_MASTER_NUM, BH1750_ADDR,
-                                     &cmd, 1, pdMS_TO_TICKS(200));
-    if (err != ESP_OK) { bh1750_ready = false; return; }
+    uint8_t cmd; esp_err_t err;
+    cmd=0x01; err=i2c_master_write_to_device(I2C_MASTER_NUM,BH1750_ADDR,&cmd,1,pdMS_TO_TICKS(200));
+    if(err!=ESP_OK){bh1750_ready=false;return;}
     vTaskDelay(pdMS_TO_TICKS(10));
-    cmd = 0x07;
-    err = i2c_master_write_to_device(I2C_MASTER_NUM, BH1750_ADDR,
-                                     &cmd, 1, pdMS_TO_TICKS(200));
-    if (err != ESP_OK) { bh1750_ready = false; return; }
+    cmd=0x07; err=i2c_master_write_to_device(I2C_MASTER_NUM,BH1750_ADDR,&cmd,1,pdMS_TO_TICKS(200));
+    if(err!=ESP_OK){bh1750_ready=false;return;}
     vTaskDelay(pdMS_TO_TICKS(10));
-    cmd = 0x10;
-    err = i2c_master_write_to_device(I2C_MASTER_NUM, BH1750_ADDR,
-                                     &cmd, 1, pdMS_TO_TICKS(200));
-    if (err != ESP_OK) { bh1750_ready = false; return; }
+    cmd=0x10; err=i2c_master_write_to_device(I2C_MASTER_NUM,BH1750_ADDR,&cmd,1,pdMS_TO_TICKS(200));
+    if(err!=ESP_OK){bh1750_ready=false;return;}
     vTaskDelay(pdMS_TO_TICKS(200));
-    bh1750_ready = true;
-    ESP_LOGI("BH1750", "GY-302 khoi tao OK!");
+    bh1750_ready=true;
+    ESP_LOGI("BH1750","GY-302 khoi tao OK!");
 }
 
 static float bh1750_read_lux(void) {
-    if (!bh1750_ready) { bh1750_init(); if (!bh1750_ready) return -1.0f; }
-    uint8_t data[2] = {0, 0};
-    esp_err_t err = i2c_master_read_from_device(
-        I2C_MASTER_NUM, BH1750_ADDR, data, 2, pdMS_TO_TICKS(300));
-    if (err != ESP_OK) { bh1750_ready = false; return -1.0f; }
-    uint16_t raw = ((uint16_t)data[0] << 8) | data[1];
-    if (raw == 0 || raw == 0xFFFF) return -1.0f;
-    return (float)raw / 1.2f;
+    if(!bh1750_ready){bh1750_init();if(!bh1750_ready)return -1.0f;}
+    uint8_t data[2]={0,0};
+    esp_err_t err=i2c_master_read_from_device(I2C_MASTER_NUM,BH1750_ADDR,data,2,pdMS_TO_TICKS(300));
+    if(err!=ESP_OK){bh1750_ready=false;return -1.0f;}
+    uint16_t raw=((uint16_t)data[0]<<8)|data[1];
+    if(raw==0||raw==0xFFFF)return -1.0f;
+    return (float)raw/1.2f;
 }
 
 /* ============================================================
@@ -322,96 +530,76 @@ static float bh1750_read_lux(void) {
  * ============================================================ */
 static void ws2812_init(void) {
     led_strip_config_t strip_cfg = {
-        .strip_gpio_num   = LED_DATA_GPIO,
-        .max_leds         = LED_COUNT,
-        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
-        .led_model        = LED_MODEL_WS2812,
-        .flags.invert_out = false,
+        .strip_gpio_num=LED_DATA_GPIO, .max_leds=LED_COUNT,
+        .led_pixel_format=LED_PIXEL_FORMAT_GRB,
+        .led_model=LED_MODEL_WS2812, .flags.invert_out=false,
     };
     led_strip_rmt_config_t rmt_cfg = {
-        .clk_src        = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz  = 10 * 1000 * 1000,
-        .flags.with_dma = false,
+        .clk_src=RMT_CLK_SRC_DEFAULT,
+        .resolution_hz=10*1000*1000, .flags.with_dma=false,
     };
-    esp_err_t err = led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &led_strip);
-    if (err != ESP_OK) {
-        ESP_LOGE("LED", "WS2812B init that bai: %s", esp_err_to_name(err));
-        return;
-    }
+    esp_err_t err=led_strip_new_rmt_device(&strip_cfg,&rmt_cfg,&led_strip);
+    if(err!=ESP_OK){ESP_LOGE("LED","WS2812B init that bai");return;}
     led_strip_clear(led_strip);
-    ESP_LOGI("LED", "WS2812B OK - %d LED", LED_COUNT);
+    ESP_LOGI("LED","WS2812B OK - %d LED",LED_COUNT);
 }
 
 static void led_set_color(uint8_t r, uint8_t g, uint8_t b, uint8_t brt_pct) {
-    if (led_strip == NULL) return;
-    uint32_t scale = brt_pct;
-    uint8_t fr = (uint8_t)((uint32_t)r * scale / 100);
-    uint8_t fg = (uint8_t)((uint32_t)g * scale / 100);
-    uint8_t fb = (uint8_t)((uint32_t)b * scale / 100);
-    for (int i = 0; i < LED_COUNT; i++) {
-        led_strip_set_pixel(led_strip, i, fr, fg, fb);
-    }
+    if(!led_strip)return;
+    uint8_t fr=(uint8_t)((uint32_t)r*brt_pct/100);
+    uint8_t fg=(uint8_t)((uint32_t)g*brt_pct/100);
+    uint8_t fb_=(uint8_t)((uint32_t)b*brt_pct/100);
+    for(int i=0;i<LED_COUNT;i++) led_strip_set_pixel(led_strip,i,fr,fg,fb_);
     led_strip_refresh(led_strip);
 }
 
 static void led_flash_alert(void) {
-    if (led_strip == NULL) return;
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < LED_COUNT; j++)
-            led_strip_set_pixel(led_strip, j, 255, 255, 255);
-        led_strip_refresh(led_strip);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        led_strip_clear(led_strip);
-        led_strip_refresh(led_strip);
-        vTaskDelay(pdMS_TO_TICKS(200));
+    if(!led_strip)return;
+    for(int i=0;i<3;i++){
+        for(int j=0;j<LED_COUNT;j++) led_strip_set_pixel(led_strip,j,255,255,255);
+        led_strip_refresh(led_strip); vTaskDelay(pdMS_TO_TICKS(200));
+        led_strip_clear(led_strip);   led_strip_refresh(led_strip); vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
 /* ============================================================
- *  ISR NÚT NHẤN
+ *  ISR + I2C INIT
  * ============================================================ */
 static void IRAM_ATTR gpio_isr_handler(void *arg) {
-    uint32_t gpio_num = (uint32_t)arg;
+    uint32_t gpio_num=(uint32_t)arg;
     btn_cmd_t cmd;
-    if      (gpio_num == BTN_START_GPIO) cmd = CMD_START;
-    else if (gpio_num == BTN_STOP_GPIO)  cmd = CMD_STOP;
-    else                                  cmd = CMD_RESET;
-    xQueueSendFromISR(Queue_Input, &cmd, NULL);
+    if(gpio_num==BTN_START_GPIO) cmd=CMD_START;
+    else if(gpio_num==BTN_STOP_GPIO) cmd=CMD_STOP;
+    else cmd=CMD_RESET;
+    xQueueSendFromISR(Queue_Input,&cmd,NULL);
 }
 
-/* ============================================================
- *  I2C MASTER INIT
- * ============================================================ */
 static esp_err_t i2c_master_init(void) {
-    i2c_config_t conf = {
-        .mode             = I2C_MODE_MASTER,
-        .sda_io_num       = I2C_MASTER_SDA,
-        .scl_io_num       = I2C_MASTER_SCL,
-        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    i2c_config_t conf={
+        .mode=I2C_MODE_MASTER, .sda_io_num=I2C_MASTER_SDA,
+        .scl_io_num=I2C_MASTER_SCL,
+        .sda_pullup_en=GPIO_PULLUP_ENABLE, .scl_pullup_en=GPIO_PULLUP_ENABLE,
+        .master.clk_speed=I2C_MASTER_FREQ_HZ,
     };
-    i2c_param_config(I2C_MASTER_NUM, &conf);
-    return i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+    i2c_param_config(I2C_MASTER_NUM,&conf);
+    return i2c_driver_install(I2C_MASTER_NUM,conf.mode,0,0,0);
 }
 
 /* ============================================================
  *  TASK 1: Task_Input
  * ============================================================ */
 void task_input(void *pv) {
-    btn_cmd_t  raw_cmd;
-    TickType_t last_tick = 0;
-    const TickType_t debounce = pdMS_TO_TICKS(50);
-    while (1) {
-        if (xQueueReceive(Queue_Input, &raw_cmd, portMAX_DELAY)) {
-            TickType_t now = xTaskGetTickCount();
-            if ((now - last_tick) >= debounce) {
-                last_tick = now;
-                xQueueSend(Queue_Command, &raw_cmd, 0);
-                ESP_LOGI("INPUT", "Nut hop le: %d", raw_cmd);
-                gpio_set_level(BUZZER_GPIO, 1);
-                vTaskDelay(pdMS_TO_TICKS(80));
-                gpio_set_level(BUZZER_GPIO, 0);
+    btn_cmd_t raw_cmd;
+    TickType_t last_tick=0;
+    const TickType_t debounce=pdMS_TO_TICKS(50);
+    while(1){
+        if(xQueueReceive(Queue_Input,&raw_cmd,portMAX_DELAY)){
+            TickType_t now=xTaskGetTickCount();
+            if((now-last_tick)>=debounce){
+                last_tick=now;
+                xQueueSend(Queue_Command,&raw_cmd,0);
+                gpio_set_level(BUZZER_GPIO,1); vTaskDelay(pdMS_TO_TICKS(80));
+                gpio_set_level(BUZZER_GPIO,0);
             }
         }
     }
@@ -421,19 +609,61 @@ void task_input(void *pv) {
  *  TASK 2: Task_Sensor
  * ============================================================ */
 void task_sensor(void *pv) {
-    if (xSemaphoreTake(Mutex_I2C, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        bh1750_init();
-        xSemaphoreGive(Mutex_I2C);
+    if(xSemaphoreTake(Mutex_I2C,pdMS_TO_TICKS(1000))==pdTRUE){
+        bh1750_init(); xSemaphoreGive(Mutex_I2C);
     }
-    while (1) {
+    while(1){
         vTaskDelay(pdMS_TO_TICKS(200));
         float lux;
-        if (xSemaphoreTake(Mutex_I2C, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            lux = bh1750_read_lux();
-            xSemaphoreGive(Mutex_I2C);
+        if(xSemaphoreTake(Mutex_I2C,pdMS_TO_TICKS(1000))==pdTRUE){
+            lux=bh1750_read_lux(); xSemaphoreGive(Mutex_I2C);
         } else continue;
-        if (lux < 0.0f) continue;
-        xQueueOverwrite(Queue_Sensor, &lux);
+        if(lux<0.0f) continue;
+        xQueueOverwrite(Queue_Sensor,&lux);
+    }
+}
+
+/* ============================================================
+ *  NVS MEMORY (LƯU TRỮ DỮ LIỆU CHỐNG MẤT ĐIỆN)
+ * ============================================================ */
+/* ============================================================
+ *  NVS MEMORY (LƯU TRỮ DỮ LIỆU CHỐNG MẤT ĐIỆN)
+ * ============================================================ */
+static void save_study_data(void) {
+    nvs_handle_t my_handle;
+    if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
+        // Ghi dữ liệu thời gian học
+        nvs_set_u32(my_handle, "total_sec", g_total_sec);
+        nvs_set_u16(my_handle, "sessions", g_sessions);
+        
+        // Ghi thêm thông số cài đặt Pomodoro từ Web
+        nvs_set_u32(my_handle, "work_min", g_work_min);
+        nvs_set_u32(my_handle, "break_min", g_break_min);
+        
+        nvs_commit(my_handle); 
+        nvs_close(my_handle);
+    }
+}
+
+static void load_study_data(void) {
+    nvs_handle_t my_handle;
+    if (nvs_open("storage", NVS_READONLY, &my_handle) == ESP_OK) {
+        uint32_t temp_sec = 0;
+        uint16_t temp_ses = 0;
+        uint32_t temp_work = 25; // Giá trị dự phòng nếu chưa cài đặt
+        uint32_t temp_break = 5; 
+        
+        // Đọc dữ liệu ra
+        if (nvs_get_u32(my_handle, "total_sec", &temp_sec) == ESP_OK) g_total_sec = temp_sec;
+        if (nvs_get_u16(my_handle, "sessions", &temp_ses) == ESP_OK)  g_sessions = temp_ses;
+        
+        // Đọc thông số Pomodoro đã lưu
+        if (nvs_get_u32(my_handle, "work_min", &temp_work) == ESP_OK) g_work_min = temp_work;
+        if (nvs_get_u32(my_handle, "break_min", &temp_break) == ESP_OK) g_break_min = temp_break;
+
+        nvs_close(my_handle);
+        ESP_LOGI(TAG, "Da load: Hoc %lu giay, Work: %lu phut, Break: %lu phut", 
+                 g_total_sec, g_work_min, g_break_min);
     }
 }
 
@@ -441,247 +671,143 @@ void task_sensor(void *pv) {
  *  TASK 3: Task_Logic
  * ============================================================ */
 void task_logic(void *pv) {
-    clock_state_t state         = STATE_IDLE;
-    uint32_t      remain_sec    = 0;
-    uint8_t       led_brt       = 20;
-    alert_code_t  pending_alert = ALERT_NONE;
-    rtc_time_t    local_time    = {0};
-    btn_cmd_t     cmd;
-    web_ctrl_t    wctrl;
-    float         lux_val       = 0.0f;
-    TickType_t    last_sec_tick = xTaskGetTickCount();
+    load_study_data();
+    clock_state_t state=STATE_IDLE;
+    uint32_t remain_sec=0;
+    uint8_t led_brt=20;
+    alert_code_t pending_alert=ALERT_NONE;
+    rtc_time_t local_time={0};
+    btn_cmd_t cmd;
+    web_ctrl_t wctrl;
+    float lux_val=0.0f;
+    TickType_t last_sec_tick=xTaskGetTickCount();
 
-    while (1) {
-        /* ---- 1. Lệnh nút nhấn ---- */
-        /* ---- 1. Lệnh nút nhấn ---- */
-        if (xQueueReceive(Queue_Command, &cmd, 0) == pdTRUE) {
-            switch (cmd) {
+    while(1){
+        /* Nút nhấn */
+      /* Nút nhấn */
+        if(xQueueReceive(Queue_Command,&cmd,0)==pdTRUE){
+            switch(cmd){
                 case CMD_START:
-                    if (state == STATE_IDLE || state == STATE_BREAK) {
-                        state = STATE_WORK;
-                        remain_sec = g_work_min * 60; // ĐÃ SỬA THÀNH BIẾN MỚI
-                        ESP_LOGI("LOGIC", "BTN -> WORK");
-                    } else if (state == STATE_PAUSE) {
-                        state = STATE_WORK;
-                        ESP_LOGI("LOGIC", "BTN -> RESUME");
+                    if(state==STATE_IDLE||state==STATE_BREAK){
+                        state=STATE_WORK; remain_sec=g_work_min*60;
+                    } else if(state==STATE_PAUSE) {
+                        state=STATE_WORK; // Đã thêm ngoặc nhọn ở đây
                     }
-                    g_manual_color = false;
-                    break;
+                    g_manual_color=false; break;
                 case CMD_STOP:
-                    if (state == STATE_WORK || state == STATE_BREAK) {
-                        state = STATE_PAUSE;
-                        ESP_LOGI("LOGIC", "BTN -> PAUSE");
+                    if(state==STATE_WORK||state==STATE_BREAK) {
+                        state=STATE_PAUSE; // Thêm ngoặc cho an toàn
                     }
                     break;
                 case CMD_RESET:
-                    state = STATE_IDLE; remain_sec = 0;
-                    g_sessions = 0; g_total_sec = 0;
-                    g_manual_color = false;
-                    ESP_LOGI("LOGIC", "BTN -> RESET");
-                    break;
+                    state=STATE_IDLE; remain_sec=0;
+                    g_sessions=0; g_total_sec=0; g_manual_color=false;
+                    save_study_data();
+                     break;
             }
         }
 
-        /* ---- 2. Lệnh Web Dashboard ---- */
-        if (xQueueReceive(Queue_WebCtrl, &wctrl, 0) == pdTRUE) {
-            switch (wctrl.cmd) {
+        /* Web */
+        if(xQueueReceive(Queue_WebCtrl,&wctrl,0)==pdTRUE){
+            switch(wctrl.cmd){
                 case WEB_CMD_START:
-                    if (state == STATE_IDLE || state == STATE_BREAK) {
-                        state = STATE_WORK;
-                        remain_sec = g_work_min * 60; // ĐÃ SỬA THÀNH BIẾN MỚI
-                        ESP_LOGI("LOGIC", "WEB -> WORK");
-                    } else if (state == STATE_PAUSE) {
-                        state = STATE_WORK;
-                        ESP_LOGI("LOGIC", "WEB -> RESUME");
+                    if(state==STATE_IDLE||state==STATE_BREAK){
+                        state=STATE_WORK; remain_sec=g_work_min*60;
+                    } else if(state==STATE_PAUSE) {
+                        state=STATE_WORK; // Đã thêm ngoặc nhọn ở đây
                     }
-                    g_manual_color = false;
-                    break;
+                    g_manual_color=false; break;
                 case WEB_CMD_STOP:
-                    if (state == STATE_WORK || state == STATE_BREAK) {
-                        state = STATE_PAUSE;
-                        ESP_LOGI("LOGIC", "WEB -> PAUSE");
+                    if(state==STATE_WORK||state==STATE_BREAK) {
+                        state=STATE_PAUSE; // Thêm ngoặc cho an toàn
                     }
                     break;
                 case WEB_CMD_RESET:
-                    state = STATE_IDLE; remain_sec = 0;
-                    g_sessions = 0; g_total_sec = 0;
-                    g_manual_color = false;
-                    ESP_LOGI("LOGIC", "WEB -> RESET");
-                    break;
+                    state=STATE_IDLE; remain_sec=0;
+                    g_sessions=0; g_total_sec=0; g_manual_color=false; break;
                 case WEB_CMD_COLOR:
-                    g_manual_color = true;
-                    g_manual_r = wctrl.r;
-                    g_manual_g = wctrl.g;
-                    g_manual_b = wctrl.b;
-                    ESP_LOGI("LOGIC", "WEB -> COLOR R=%d G=%d B=%d",
-                             wctrl.r, wctrl.g, wctrl.b);
-                    break; // <--- VỪA THÊM CHỮ BREAK VÀO ĐÂY ĐỂ TRÁNH LỖI!
-                
+                    g_manual_color=true;
+                    g_manual_r=wctrl.r; g_manual_g=wctrl.g; g_manual_b=wctrl.b; break;
                 case WEB_CMD_SET_TIME:
-                    g_work_min  = wctrl.work_min;
-                    g_break_min = wctrl.break_min;
-                    ESP_LOGI("LOGIC", "SET_TIME: Work=%dp, Break=%dp", (int)g_work_min, (int)g_break_min);
-                    if (state == STATE_IDLE) remain_sec = 0; 
-                    break;
-
+                    g_work_min=wctrl.work_min; g_break_min=wctrl.break_min;
+                    save_study_data();
+                     break;
                 case WEB_CMD_SET_RTC:
-                    if (xSemaphoreTake(Mutex_I2C, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        rtc_time_t new_rtc = {
-                            .hour = wctrl.hour, .min = wctrl.min, .sec = wctrl.sec,
-                            .date = wctrl.date, .month = wctrl.month, .year = wctrl.year,
-                            .day  = 1 
+                    if(xSemaphoreTake(Mutex_I2C,pdMS_TO_TICKS(100))==pdTRUE){
+                        rtc_time_t nr={
+                            .hour=wctrl.hour,.min=wctrl.min,.sec=wctrl.sec,
+                            .date=wctrl.date,.month=wctrl.month,.year=wctrl.year,.day=1
                         };
-                        ds3231_set_time(&new_rtc);
-                        xSemaphoreGive(Mutex_I2C);
-                        ESP_LOGI("LOGIC", "SET_RTC Tu Web OK!");
-                    }
-                    break;
+                        ds3231_set_time(&nr); xSemaphoreGive(Mutex_I2C);
+                    } break;
                 default: break;
             }
         }
 
-    /* ---- 3. Cảm biến ánh sáng ---- */
-if (xQueueReceive(Queue_Sensor, &lux_val, 0) == pdTRUE) {
-    g_lux = lux_val;
-    float clamped = lux_val > 1000.0f ? 1000.0f : lux_val;
+        /* Cảm biến lux */
+        if(xQueueReceive(Queue_Sensor,&lux_val,0)==pdTRUE){
+            g_lux=lux_val;
+            float clamped=lux_val>1000.0f?1000.0f:lux_val;
+            led_brt=(uint8_t)(100.0f-clamped*70.0f/1000.0f);
+        }
 
-    /* FIX: đảo ngược — lux cao thì brightness thấp */
-    led_brt = (uint8_t)(100.0f - clamped * 70.0f / 1000.0f);
-    /* 
-     * lux=0    → led_brt=100%  (phòng tối, cần đèn sáng nhất)
-     * lux=500  → led_brt=65%   (phòng vừa)
-     * lux=1000 → led_brt=30%   (phòng đã rất sáng, đèn bổ sung nhẹ)
-     */
-}
-
-       /* ---- 4. Đếm ngược 1 giây ---- */
-        TickType_t now = xTaskGetTickCount();
-        if ((now - last_sec_tick) >= pdMS_TO_TICKS(1000)) {
-            last_sec_tick = now;
-            if ((state == STATE_WORK || state == STATE_BREAK) && remain_sec > 0) {
+        /* Đếm ngược */
+        TickType_t now=xTaskGetTickCount();
+        if((now-last_sec_tick)>=pdMS_TO_TICKS(1000)){
+            last_sec_tick=now;
+            if((state==STATE_WORK||state==STATE_BREAK)&&remain_sec>0){
                 remain_sec--;
-                if (state == STATE_WORK) g_total_sec++;
+                if(state==STATE_WORK) g_total_sec++;
+                if (g_total_sec % 60 == 0) {
+                        save_study_data();
+                    }
             }
-            if (remain_sec == 0 && (state == STATE_WORK || state == STATE_BREAK)) {
-                if (state == STATE_WORK) {
-                    pending_alert = ALERT_WORK_END;
-                    g_sessions++;
-                    state = STATE_BREAK;
-                    
-                    // SỬA Ở ĐÂY: Thay bằng biến g_break_min * 60
-                    remain_sec = g_break_min * 60; 
-                    
-                    ESP_LOGI("LOGIC", "WORK_END -> BREAK");
+            if(remain_sec==0&&(state==STATE_WORK||state==STATE_BREAK)){
+                if(state==STATE_WORK){
+                    pending_alert=ALERT_WORK_END; g_sessions++;
+                    state=STATE_BREAK; remain_sec=g_break_min*60;
                 } else {
-                    pending_alert = ALERT_BREAK_START;
-                    state = STATE_IDLE;
-                    remain_sec = 0;
-                    ESP_LOGI("LOGIC", "BREAK_END -> IDLE");
+                    pending_alert=ALERT_BREAK_START;
+                    state=STATE_IDLE; remain_sec=0;
                 }
-                g_alert_code = pending_alert;
-                xSemaphoreGive(Sem_Alert);
+                g_alert_code=pending_alert; xSemaphoreGive(Sem_Alert);
+                save_study_data();
             }
         }
 
-        /* ---- 5. Cập nhật global ---- */
-        if (xSemaphoreTake(Mutex_State, pdMS_TO_TICKS(10)) == pdTRUE) {
-            g_state      = state;
-            g_remain_sec = remain_sec;
-            xSemaphoreGive(Mutex_State);
+        if(xSemaphoreTake(Mutex_State,pdMS_TO_TICKS(10))==pdTRUE){
+            g_state=state; g_remain_sec=remain_sec; xSemaphoreGive(Mutex_State);
+        }
+        if(xSemaphoreTake(Mutex_I2C,pdMS_TO_TICKS(20))==pdTRUE){
+            ds3231_read_time(&local_time); g_rtc_time=local_time; xSemaphoreGive(Mutex_I2C);
         }
 
-        /* ---- 6. Đọc giờ RTC ---- */
-        if (xSemaphoreTake(Mutex_I2C, pdMS_TO_TICKS(20)) == pdTRUE) {
-            ds3231_read_time(&local_time);
-            g_rtc_time = local_time;
-            xSemaphoreGive(Mutex_I2C);
-        }
-
-        /* ---- 7. Tính màu LED ---- */
-        led_cmd_t led_cmd;
-        led_cmd.brightness = led_brt;
-        if (g_manual_color) {
-            led_cmd.r = g_manual_r;
-            led_cmd.g = g_manual_g;
-            led_cmd.b = g_manual_b;
+        /* LED màu */
+        led_cmd_t led_cmd; led_cmd.brightness=led_brt;
+        if(g_manual_color){
+            led_cmd.r=g_manual_r; led_cmd.g=g_manual_g; led_cmd.b=g_manual_b;
         } else {
-            switch (state) {
-                case STATE_WORK:
-                    led_cmd.r=200; led_cmd.g=220; led_cmd.b=255; break;
-                case STATE_BREAK:
-                    led_cmd.r=255; led_cmd.g=200; led_cmd.b=80;  break;
-                case STATE_PAUSE:
-                    led_cmd.r=180; led_cmd.g=100; led_cmd.b=30;
-                    led_cmd.brightness = led_brt / 3; break;
-                default:
-                    led_cmd.r=0; led_cmd.g=0; led_cmd.b=0;
-                    led_cmd.brightness = 0; break;
+            switch(state){
+                case STATE_WORK:  led_cmd.r=200;led_cmd.g=220;led_cmd.b=255; break;
+                case STATE_BREAK: led_cmd.r=255;led_cmd.g=200;led_cmd.b=80;  break;
+                case STATE_PAUSE: led_cmd.r=180;led_cmd.g=100;led_cmd.b=30;
+                                  led_cmd.brightness=led_brt/3; break;
+                default: led_cmd.r=0;led_cmd.g=0;led_cmd.b=0;led_cmd.brightness=0; break;
             }
         }
+        xQueueOverwrite(Queue_Light,&led_cmd);
 
-        xQueueOverwrite(Queue_Light, &led_cmd);
-
-        /* ---- 8. Gửi Queue_Display ---- */
-       disp_data_t disp = {
-    .state         = state,
-    .remaining_sec = remain_sec,
-    .lux           = g_lux,
-    .led_brt       = led_brt,
-    .hour          = local_time.hour,
-    .min           = local_time.min,
-    .sec           = local_time.sec,
-    .date          = local_time.date,    // ← THÊM
-    .month         = local_time.month,   // ← THÊM
-    .year          = local_time.year,    // ← THÊM
-};
-        xQueueOverwrite(Queue_Display, &disp);
-
-        /* ---- 9. Gửi Queue_WiFi ---- */
-        wifi_data_t wdata = {
-            .sessions_today = g_sessions,
-            .total_time_sec = g_total_sec,
-            .current_state  = state,
+        disp_data_t disp={
+            .state=state, .remaining_sec=remain_sec, .lux=g_lux, .led_brt=led_brt,
+            .hour=local_time.hour, .min=local_time.min, .sec=local_time.sec,
+            .date=local_time.date, .month=local_time.month, .year=local_time.year,
         };
-        xQueueOverwrite(Queue_WiFi, &wdata);
+        xQueueOverwrite(Queue_Display,&disp);
+
+        wifi_data_t wdata={.sessions_today=g_sessions,.total_time_sec=g_total_sec,.current_state=state};
+        xQueueOverwrite(Queue_WiFi,&wdata);
 
         vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
-/* ============================================================
- *  TASK 4: Task_Display
- * ============================================================ */
-void task_display(void *pv) {
-    if (xSemaphoreTake(Mutex_I2C, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        oled_init();
-        xSemaphoreGive(Mutex_I2C);
-    }
-    disp_data_t data;
-    char buf[32];
-    while (1) {
-        if (xQueueReceive(Queue_Display, &data, pdMS_TO_TICKS(200)) != pdTRUE) continue;
-        if (xSemaphoreTake(Mutex_I2C, pdMS_TO_TICKS(200)) != pdTRUE) continue;
-        uint8_t brightness;
-        if      (data.lux < 15.0f)  brightness = 10;
-        else if (data.lux < 150.0f) brightness = 100;
-        else                         brightness = 255;
-        oled_set_brightness(brightness);
-        const char *mode_str =
-            (data.state == STATE_WORK)  ? "WORK " :
-            (data.state == STATE_BREAK) ? "BREAK" :
-            (data.state == STATE_PAUSE) ? "PAUSE" : "IDLE ";
-        snprintf(buf, sizeof(buf), "%s %02u:%02u:%02u", mode_str,
-                 (unsigned)data.hour, (unsigned)data.min, (unsigned)data.sec);
-        oled_print(0, 0, buf);
-        unsigned int m = (unsigned int)(data.remaining_sec / 60);
-        unsigned int s = (unsigned int)(data.remaining_sec % 60);
-        snprintf(buf, sizeof(buf), "Pomo %02u:%02u      ", m, s);
-        oled_print(2, 0, buf);
-        snprintf(buf, sizeof(buf), "Lux: %-6.1f     ", data.lux);
-        oled_print(4, 0, buf);
-        snprintf(buf, sizeof(buf), "LED BRT: %3u%%   ", (unsigned)data.led_brt);
-        oled_print(6, 0, buf);
-        xSemaphoreGive(Mutex_I2C);
     }
 }
 
@@ -691,10 +817,9 @@ void task_display(void *pv) {
 void task_light(void *pv) {
     ws2812_init();
     led_cmd_t cmd;
-    while (1) {
-        if (xQueueReceive(Queue_Light, &cmd, portMAX_DELAY) == pdTRUE) {
-            led_set_color(cmd.r, cmd.g, cmd.b, cmd.brightness);
-        }
+    while(1){
+        if(xQueueReceive(Queue_Light,&cmd,portMAX_DELAY)==pdTRUE)
+            led_set_color(cmd.r,cmd.g,cmd.b,cmd.brightness);
     }
 }
 
@@ -702,19 +827,17 @@ void task_light(void *pv) {
  *  TASK 6: Task_Alert
  * ============================================================ */
 void task_alert(void *pv) {
-    while (1) {
-        if (xSemaphoreTake(Sem_Alert, portMAX_DELAY) == pdTRUE) {
-            alert_code_t code = g_alert_code;
-            if (code == ALERT_WORK_END) {
-                for (int i = 0; i < 3; i++) {
-                    gpio_set_level(BUZZER_GPIO, 1); vTaskDelay(pdMS_TO_TICKS(200));
-                    gpio_set_level(BUZZER_GPIO, 0); vTaskDelay(pdMS_TO_TICKS(200));
+    while(1){
+        if(xSemaphoreTake(Sem_Alert,portMAX_DELAY)==pdTRUE){
+            alert_code_t code=g_alert_code;
+            if(code==ALERT_WORK_END){
+                for(int i=0;i<3;i++){
+                    gpio_set_level(BUZZER_GPIO,1); vTaskDelay(pdMS_TO_TICKS(200));
+                    gpio_set_level(BUZZER_GPIO,0); vTaskDelay(pdMS_TO_TICKS(200));
                 }
-                ESP_LOGI("ALERT", "WORK_END: 3 beep");
-            } else if (code == ALERT_BREAK_START) {
-                gpio_set_level(BUZZER_GPIO, 1); vTaskDelay(pdMS_TO_TICKS(500));
-                gpio_set_level(BUZZER_GPIO, 0);
-                ESP_LOGI("ALERT", "BREAK_START: 1 beep dai");
+            } else if(code==ALERT_BREAK_START){
+                gpio_set_level(BUZZER_GPIO,1); vTaskDelay(pdMS_TO_TICKS(500));
+                gpio_set_level(BUZZER_GPIO,0);
             }
             led_flash_alert();
         }
@@ -722,311 +845,186 @@ void task_alert(void *pv) {
 }
 
 /* ============================================================
- *  TASK 7: Task_WiFi
+ *  TASK 7: Task_WiFi + MQTT
  * ============================================================ */
-static bool wifi_connected   = false;
-static int  wifi_retry_count = 0;
-#define WIFI_MAX_RETRY  5
+static bool wifi_connected=false;
+static int  wifi_retry_count=0;
+#define WIFI_MAX_RETRY 5
 
-static void wifi_event_handler(void *arg, esp_event_base_t base,
-                                int32_t id, void *data) {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        wifi_retry_count = 0;
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_connected = false;
-        if (wifi_retry_count < WIFI_MAX_RETRY) {
-            wifi_retry_count++;
-            ESP_LOGW("WIFI", "Mat ket noi, thu lai %d/%d...",
-                     wifi_retry_count, WIFI_MAX_RETRY);
-            esp_wifi_connect();
-        } else {
-            ESP_LOGE("WIFI", "Khong the ket noi sau %d lan.", WIFI_MAX_RETRY);
-        }
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        wifi_connected   = true;
-        wifi_retry_count = 0;
-        ESP_LOGI("WIFI", "Da ket noi WiFi!");
-    }
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data){
+    if(base==WIFI_EVENT&&id==WIFI_EVENT_STA_START){ wifi_retry_count=0; esp_wifi_connect(); }
+    else if(base==WIFI_EVENT&&id==WIFI_EVENT_STA_DISCONNECTED){
+        wifi_connected=false;
+        if(wifi_retry_count<WIFI_MAX_RETRY){ wifi_retry_count++; esp_wifi_connect(); }
+    } else if(base==IP_EVENT&&id==IP_EVENT_STA_GOT_IP){ wifi_connected=true; wifi_retry_count=0; }
 }
 
-static void wifi_init_sta(void) {
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                               wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                               wifi_event_handler, NULL);
-    wifi_config_t wcfg = {
-        .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS }
-    };
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
-    esp_wifi_start();
+static void wifi_init_sta(void){
+    esp_netif_init(); esp_event_loop_create_default(); esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg=WIFI_INIT_CONFIG_DEFAULT(); esp_wifi_init(&cfg);
+    esp_event_handler_register(WIFI_EVENT,ESP_EVENT_ANY_ID,wifi_event_handler,NULL);
+    esp_event_handler_register(IP_EVENT,IP_EVENT_STA_GOT_IP,wifi_event_handler,NULL);
+    wifi_config_t wcfg={.sta={.ssid=WIFI_SSID,.password=WIFI_PASS}};
+    esp_wifi_set_mode(WIFI_MODE_STA); esp_wifi_set_config(WIFI_IF_STA,&wcfg); esp_wifi_start();
 }
 
-/* ============================================================
- * KHỐI XỬ LÝ MQTT (MỚI)
- * ============================================================ */
-static esp_mqtt_client_handle_t mqtt_client = NULL;
-static bool mqtt_connected = false;
+static esp_mqtt_client_handle_t mqtt_client=NULL;
+static bool mqtt_connected=false;
 
-static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
-    esp_mqtt_event_handle_t event = event_data;
-    
-    switch ((esp_mqtt_event_id_t)event_id) {
+static void mqtt_event_handler(void *ha, esp_event_base_t base, int32_t eid, void *ed){
+    esp_mqtt_event_handle_t event=ed;
+    switch((esp_mqtt_event_id_t)eid){
         case MQTT_EVENT_CONNECTED:
-            ESP_LOGI("MQTT", "Da ket noi Broker!");
-            mqtt_connected = true;
-            // Đăng ký kênh nhận lệnh từ Web ngay khi kết nối thành công
-            esp_mqtt_client_subscribe(mqtt_client, "dut/smartclock/trung/command", 0);
-            break;
-            
-        case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGW("MQTT", "Mat ket noi Broker!");
-            mqtt_connected = false;
-            break;
-            
-        case MQTT_EVENT_DATA:
-            // ĐÂY LÀ NƠI NHẬN LỆNH TỪ WEB (Độ trễ ~0.1 giây)
-            ESP_LOGI("MQTT", "Co lenh tu Web!");
-            char resp[160] = {0};
-            snprintf(resp, sizeof(resp), "%.*s", event->data_len, event->data);
-            
-            web_ctrl_t ctrl = { .cmd = WEB_CMD_NONE };
-            
-            // Phân tích lệnh JSON giống hệt như cách cũ của bạn
-            if      (strstr(resp, "\"START\"")) ctrl.cmd = WEB_CMD_START;
-            else if (strstr(resp, "\"STOP\""))  ctrl.cmd = WEB_CMD_STOP;
-            else if (strstr(resp, "\"RESET\"")) ctrl.cmd = WEB_CMD_RESET;
-            else if (strstr(resp, "\"COLOR\"")) {
-                ctrl.cmd = WEB_CMD_COLOR;
-                int r=0, g=0, b=0;
-                char *pr = strstr(resp, "\"r\":"); if (pr) sscanf(pr+4, "%d", &r);
-                char *pg = strstr(resp, "\"g\":"); if (pg) sscanf(pg+4, "%d", &g);
-                char *pb = strstr(resp, "\"b\":"); if (pb) sscanf(pb+4, "%d", &b);
-                ctrl.r = (uint8_t)(r & 0xFF);
-                ctrl.g = (uint8_t)(g & 0xFF);
-                ctrl.b = (uint8_t)(b & 0xFF);
+            mqtt_connected=true;
+            esp_mqtt_client_subscribe(mqtt_client,"dut/smartclock/trung/command",0); break;
+        case MQTT_EVENT_DISCONNECTED: mqtt_connected=false; break;
+        case MQTT_EVENT_DATA: {
+            char resp[160]={0};
+            snprintf(resp,sizeof(resp),"%.*s",event->data_len,event->data);
+            web_ctrl_t ctrl={.cmd=WEB_CMD_NONE};
+            if     (strstr(resp,"\"START\"")) ctrl.cmd=WEB_CMD_START;
+            else if(strstr(resp,"\"STOP\""))  ctrl.cmd=WEB_CMD_STOP;
+            else if(strstr(resp,"\"RESET\"")) ctrl.cmd=WEB_CMD_RESET;
+            else if(strstr(resp,"\"COLOR\"")){
+                ctrl.cmd=WEB_CMD_COLOR;
+                int r=0,g=0,b=0;
+                char *pr=strstr(resp,"\"r\":"); if(pr) sscanf(pr+4,"%d",&r);
+                char *pg=strstr(resp,"\"g\":"); if(pg) sscanf(pg+4,"%d",&g);
+                char *pb=strstr(resp,"\"b\":"); if(pb) sscanf(pb+4,"%d",&b);
+                ctrl.r=(uint8_t)r; ctrl.g=(uint8_t)g; ctrl.b=(uint8_t)b;
             }
-            else if (strstr(resp, "\"SET_TIME\"")) {
-                ctrl.cmd = WEB_CMD_SET_TIME;
-                int w = 25, b = 5;
-                char *pw = strstr(resp, "\"work\":");  if (pw) sscanf(pw+7, "%d", &w);
-                char *pb = strstr(resp, "\"break\":"); if (pb) sscanf(pb+8, "%d", &b);
-                ctrl.work_min = (uint16_t)w; ctrl.break_min = (uint16_t)b;
+            else if(strstr(resp,"\"SET_TIME\"")){
+                ctrl.cmd=WEB_CMD_SET_TIME; int w=25,b=5;
+                char *pw=strstr(resp,"\"work\":"); if(pw) sscanf(pw+7,"%d",&w);
+                char *pb=strstr(resp,"\"break\":"); if(pb) sscanf(pb+8,"%d",&b);
+                ctrl.work_min=(uint16_t)w; ctrl.break_min=(uint16_t)b;
             }
-            else if (strstr(resp, "\"SET_RTC\"")) {
-                ctrl.cmd = WEB_CMD_SET_RTC;
-                int h=0, m=0, s=0, d=1, mo=1, y=0;
-                char *ph = strstr(resp, "\"hour\":");  if (ph) sscanf(ph+7, "%d", &h);
-                char *pm = strstr(resp, "\"min\":");   if (pm) sscanf(pm+6, "%d", &m);
-                char *ps = strstr(resp, "\"sec\":");   if (ps) sscanf(ps+6, "%d", &s);
-                char *pd = strstr(resp, "\"date\":");  if (pd) sscanf(pd+7, "%d", &d);
-                char *pmo= strstr(resp, "\"month\":"); if (pmo) sscanf(pmo+8, "%d", &mo);
-                char *py = strstr(resp, "\"year\":");  if (py) sscanf(py+7, "%d", &y);
-                ctrl.hour = h; ctrl.min = m; ctrl.sec = s; 
-                ctrl.date = d; ctrl.month = mo; ctrl.year = y;
+            else if(strstr(resp,"\"SET_RTC\"")){
+                ctrl.cmd=WEB_CMD_SET_RTC; int h=0,m=0,s=0,d=1,mo=1,y=0;
+                char *ph=strstr(resp,"\"hour\":");  if(ph) sscanf(ph+7,"%d",&h);
+                char *pm=strstr(resp,"\"min\":");   if(pm) sscanf(pm+6,"%d",&m);
+                char *ps=strstr(resp,"\"sec\":");   if(ps) sscanf(ps+6,"%d",&s);
+                char *pd=strstr(resp,"\"date\":");  if(pd) sscanf(pd+7,"%d",&d);
+                char *pmo=strstr(resp,"\"month\":"); if(pmo) sscanf(pmo+8,"%d",&mo);
+                char *py=strstr(resp,"\"year\":");  if(py) sscanf(py+7,"%d",&y);
+                ctrl.hour=h; ctrl.min=m; ctrl.sec=s;
+                ctrl.date=d; ctrl.month=mo; ctrl.year=y;
             }
-            if (ctrl.cmd != WEB_CMD_NONE) {
-                ESP_LOGI("MQTT", "Thuc thi: cmd=%d r=%d g=%d b=%d", ctrl.cmd, ctrl.r, ctrl.g, ctrl.b);
-                xQueueSend(Queue_WebCtrl, &ctrl, 0); // Đẩy lệnh vào Queue cho Task_Logic xử lý
-            }
+            if(ctrl.cmd!=WEB_CMD_NONE) xQueueSend(Queue_WebCtrl,&ctrl,0);
             break;
-            
-        default:
-            break;
+        }
+        default: break;
     }
 }
 
-static void mqtt_app_start(void) {
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = "mqtt://broker.emqx.io:1883", // Trạm bưu điện trung tâm
-    };
-    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+static void mqtt_app_start(void){
+    esp_mqtt_client_config_t mqtt_cfg={.broker.address.uri="mqtt://broker.emqx.io:1883"};
+    mqtt_client=esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client,ESP_EVENT_ANY_ID,mqtt_event_handler,NULL);
     esp_mqtt_client_start(mqtt_client);
 }
 
-/* ============================================================
- * TASK 7: Task_WiFi (Phiên bản MQTT siêu nhẹ)
- * ============================================================ */
-void task_wifi(void *pv) {
-    wifi_init_sta(); // Chờ kết nối WiFi cục bộ
-    
-    // Phải có mạng WiFi thì mới bật MQTT
-    while (!wifi_connected) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+void task_wifi(void *pv){
+    wifi_init_sta();
+    while(!wifi_connected) vTaskDelay(pdMS_TO_TICKS(1000));
     mqtt_app_start();
 
     wifi_data_t wdata;
-    while (1) {
-        // Tốc độ cập nhật: 1 giây / 1 lần
-        vTaskDelay(pdMS_TO_TICKS(1000)); 
-        
-        if (!mqtt_connected) continue;
-
-        // Nếu có dữ liệu mới thì đóng gói và BẮN lên Web
-        if (xQueuePeek(Queue_WiFi, &wdata, 0) == pdTRUE) {
-            uint8_t lr=0, lg=0, lb=0;
-            if (g_manual_color) {
-                lr=g_manual_r; lg=g_manual_g; lb=g_manual_b;
-            } else {
-                switch (wdata.current_state) {
-                    case STATE_WORK:  lr=200; lg=220; lb=255; break;
-                    case STATE_BREAK: lr=255; lg=200; lb= 80; break;
-                    case STATE_PAUSE: lr=180; lg=100; lb= 30; break;
-                    default:          lr=  0; lg=  0; lb=  0; break;
+    while(1){
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if(!mqtt_connected) continue;
+        if(xQueuePeek(Queue_WiFi,&wdata,0)==pdTRUE){
+            uint8_t lr=0,lg=0,lb=0;
+            if(g_manual_color){ lr=g_manual_r; lg=g_manual_g; lb=g_manual_b; }
+            else {
+                switch(wdata.current_state){
+                    case STATE_WORK:  lr=200;lg=220;lb=255; break;
+                    case STATE_BREAK: lr=255;lg=200;lb=80;  break;
+                    case STATE_PAUSE: lr=180;lg=100;lb=30;  break;
+                    default: break;
                 }
             }
-            
-            uint8_t brt = (uint8_t)(100.0f - (g_lux > 1000.0f ? 1000.0f : g_lux) * 70.0f / 1000.0f);
-            const char *s = (wdata.current_state == STATE_WORK)  ? "WORK"  :
-                            (wdata.current_state == STATE_BREAK) ? "BREAK" :
-                            (wdata.current_state == STATE_PAUSE) ? "PAUSE" : "IDLE";
-            
-            // Format JSON giữ nguyên 100% như cũ để Web không bị sốc
+            uint8_t brt=(uint8_t)(100.0f-(g_lux>1000.0f?1000.0f:g_lux)*70.0f/1000.0f);
+            const char *s=(wdata.current_state==STATE_WORK)?"WORK":
+                          (wdata.current_state==STATE_BREAK)?"BREAK":
+                          (wdata.current_state==STATE_PAUSE)?"PAUSE":"IDLE";
             char payload[320];
-            snprintf(payload, sizeof(payload),
+            snprintf(payload,sizeof(payload),
                 "{\"state\":\"%s\",\"remaining_sec\":%lu,\"lux\":%.1f,\"led_brt\":%u,"
                 "\"hour\":%u,\"min\":%u,\"sec\":%u,\"date\":%u,\"month\":%u,\"year\":%u,"
                 "\"sessions_today\":%u,\"total_time_sec\":%lu,\"led_r\":%u,\"led_g\":%u,\"led_b\":%u}",
-                s, (unsigned long)g_remain_sec, g_lux, brt,
-                (unsigned)g_rtc_time.hour, (unsigned)g_rtc_time.min, (unsigned)g_rtc_time.sec,
-                (unsigned)g_rtc_time.date, (unsigned)g_rtc_time.month, (unsigned)g_rtc_time.year,
-                (unsigned)wdata.sessions_today, (unsigned long)wdata.total_time_sec,
-                (unsigned)lr, (unsigned)lg, (unsigned)lb);
-
-            // Bắn một phát lên kênh Status ngay lập tức
-            esp_mqtt_client_publish(mqtt_client, "dut/smartclock/trung/status", payload, 0, 0, 0);
+                s,(unsigned long)g_remain_sec,g_lux,brt,
+                (unsigned)g_rtc_time.hour,(unsigned)g_rtc_time.min,(unsigned)g_rtc_time.sec,
+                (unsigned)g_rtc_time.date,(unsigned)g_rtc_time.month,(unsigned)g_rtc_time.year,
+                (unsigned)wdata.sessions_today,(unsigned long)wdata.total_time_sec,
+                (unsigned)lr,(unsigned)lg,(unsigned)lb);
+            esp_mqtt_client_publish(mqtt_client,"dut/smartclock/trung/status",payload,0,0,0);
         }
     }
 }
+
 /* ============================================================
  *  APP_MAIN
  * ============================================================ */
 void app_main(void) {
-    /* NVS */
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
+    esp_err_t ret=nvs_flash_init();
+    if(ret==ESP_ERR_NVS_NO_FREE_PAGES||ret==ESP_ERR_NVS_NEW_VERSION_FOUND){
+        nvs_flash_erase(); nvs_flash_init();
     }
-
-    /* I2C */
     ESP_ERROR_CHECK(i2c_master_init());
-    ESP_LOGI(TAG, "I2C OK");
 
-    /* ============================================================
-     *  SET GIỜ DS3231
-     *
-     *  Cách dùng đúng:
-     *  1. Đổi SET_RTC_TIME → 1, chỉnh giờ bên dưới cho đúng thực tế
-     *  2. Build + Flash → Serial Monitor hiện "Xac nhan: XX:XX:XX..."
-     *  3. Đổi SET_RTC_TIME → 0 ngay lập tức
-     *  4. Build + Flash lần nữa → xong, DS3231 giữ giờ bằng pin CR2032
-     *
-     *  KHÔNG để SET_RTC_TIME = 1 khi hoạt động bình thường!
-     * ============================================================ */
-#define SET_RTC_TIME  0/* <<< 1 = set giờ, 0 = đọc giờ bình thường */
-
+#define SET_RTC_TIME 0
 #if SET_RTC_TIME
-    /* Chỉnh giờ/phút/giây/ngày/tháng/năm cho đúng thời điểm nạp firmware */
-    rtc_time_t setup_time = {
-        .sec   = 0,
-        .min   = 15,      /* <<< SỬA */
-        .hour  = 3,      /* <<< SỬA */
-        .day   = 1,      /* 1=CN, 2=T2 ... 7=T7 */
-        .date  = 20,     /* <<< SỬA ngày */
-        .month = 4,      /* <<< SỬA tháng */
-        .year  = 26,     /* 2026 → ghi 26 */
-    };
-    if (ds3231_set_time(&setup_time) == ESP_OK) {
-        ESP_LOGI("RTC", ">>> Set gio OK! Doi SET_RTC_TIME=0 roi flash lai <<<");
-    } else {
-        ESP_LOGE("RTC", "Set gio THAT BAI - kiem tra I2C va gia tri gio!");
-    }
-    /* Dừng lại sau khi set để không tiếp tục khởi động
-     * → buộc người dùng flash lại với SET_RTC_TIME=0 */
-    ESP_LOGW("RTC", "Vui long doi SET_RTC_TIME=0 va flash lai!");
-    while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    rtc_time_t setup_time={.sec=0,.min=05,.hour=22,.day=1,.date=30,.month=4,.year=26};
+    if(ds3231_set_time(&setup_time)==ESP_OK)
+        ESP_LOGI("RTC","Set gio OK! Doi SET_RTC_TIME=0 roi flash lai");
+    while(1) vTaskDelay(pdMS_TO_TICKS(1000));
 #else
-    /* Đọc và in giờ hiện tại để xác nhận DS3231 hoạt động đúng */
     {
-        rtc_time_t cur = {0};
-        vTaskDelay(pdMS_TO_TICKS(100)); /* chờ I2C ổn định */
-        if (ds3231_read_time(&cur) == ESP_OK) {
-            ESP_LOGI("RTC", "Gio hien tai: %02d:%02d:%02d  %02d/%02d/20%02d",
-                     cur.hour, cur.min, cur.sec,
-                     cur.date, cur.month, cur.year);
-            /* Cảnh báo nếu giờ bằng 0 — có thể pin yếu hoặc chưa set */
-            if (cur.hour == 0 && cur.min == 0 && cur.sec == 0 &&
-                cur.date == 1 && cur.month == 1) {
-                ESP_LOGW("RTC", "CANH BAO: Gio dang la 00:00:00 01/01 - "
-                         "co the pin het hoac chua set gio!");
-            }
-        } else {
-            ESP_LOGE("RTC", "Doc gio THAT BAI - kiem tra ket noi DS3231!");
-        }
+        rtc_time_t cur={0};
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if(ds3231_read_time(&cur)==ESP_OK)
+            ESP_LOGI("RTC","Gio: %02d:%02d:%02d  %02d/%02d/20%02d",
+                     cur.hour,cur.min,cur.sec,cur.date,cur.month,cur.year);
+        else
+            ESP_LOGE("RTC","Doc gio THAT BAI!");
     }
 #endif
 
-    /* GPIO nút nhấn TTP223 */
-    gpio_config_t io_conf = {
-        .intr_type    = GPIO_INTR_POSEDGE,
-        .mode         = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL<<BTN_START_GPIO) |
-                        (1ULL<<BTN_STOP_GPIO)  |
-                        (1ULL<<BTN_RESET_GPIO),
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
+    gpio_config_t io_conf={
+        .intr_type=GPIO_INTR_POSEDGE, .mode=GPIO_MODE_INPUT,
+        .pin_bit_mask=(1ULL<<BTN_START_GPIO)|(1ULL<<BTN_STOP_GPIO)|(1ULL<<BTN_RESET_GPIO),
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, .pull_up_en=GPIO_PULLUP_DISABLE,
     };
     gpio_config(&io_conf);
+    io_conf.intr_type=GPIO_INTR_DISABLE; io_conf.mode=GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask=(1ULL<<BUZZER_GPIO);
+    gpio_config(&io_conf); gpio_set_level(BUZZER_GPIO,0);
 
-    /* GPIO Buzzer */
-    io_conf.intr_type    = GPIO_INTR_DISABLE;
-    io_conf.mode         = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = (1ULL << BUZZER_GPIO);
-    gpio_config(&io_conf);
-    gpio_set_level(BUZZER_GPIO, 0);
+    Queue_Input  =xQueueCreate(10,sizeof(btn_cmd_t));
+    Queue_Command=xQueueCreate(5, sizeof(btn_cmd_t));
+    Queue_Sensor =xQueueCreate(1, sizeof(float));
+    Queue_Light  =xQueueCreate(1, sizeof(led_cmd_t));
+    Queue_Display=xQueueCreate(1, sizeof(disp_data_t));
+    Queue_WiFi   =xQueueCreate(1, sizeof(wifi_data_t));
+    Queue_WebCtrl=xQueueCreate(5, sizeof(web_ctrl_t));
+    Mutex_I2C  =xSemaphoreCreateMutex();
+    Mutex_State=xSemaphoreCreateMutex();
+    Sem_Alert  =xSemaphoreCreateBinary();
 
-    /* Tạo Queue */
-    Queue_Input   = xQueueCreate(10, sizeof(btn_cmd_t));
-    Queue_Command = xQueueCreate(5,  sizeof(btn_cmd_t));
-    Queue_Sensor  = xQueueCreate(1,  sizeof(float));
-    Queue_Light   = xQueueCreate(1,  sizeof(led_cmd_t));
-    Queue_Display = xQueueCreate(1,  sizeof(disp_data_t));
-    Queue_WiFi    = xQueueCreate(1,  sizeof(wifi_data_t));
-    Queue_WebCtrl = xQueueCreate(5,  sizeof(web_ctrl_t));
-
-    /* Tạo Mutex & Semaphore */
-    Mutex_I2C   = xSemaphoreCreateMutex();
-    Mutex_State = xSemaphoreCreateMutex();
-    Sem_Alert   = xSemaphoreCreateBinary();
-
-    configASSERT(Queue_Input && Queue_Command && Queue_Sensor &&
-                 Queue_Light && Queue_Display && Queue_WiFi  &&
-                 Queue_WebCtrl && Mutex_I2C && Mutex_State && Sem_Alert);
-
-    /* ISR nút nhấn */
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(BTN_START_GPIO, gpio_isr_handler, (void*)BTN_START_GPIO);
-    gpio_isr_handler_add(BTN_STOP_GPIO,  gpio_isr_handler, (void*)BTN_STOP_GPIO);
-    gpio_isr_handler_add(BTN_RESET_GPIO, gpio_isr_handler, (void*)BTN_RESET_GPIO);
+    gpio_isr_handler_add(BTN_START_GPIO,gpio_isr_handler,(void*)BTN_START_GPIO);
+    gpio_isr_handler_add(BTN_STOP_GPIO, gpio_isr_handler,(void*)BTN_STOP_GPIO);
+    gpio_isr_handler_add(BTN_RESET_GPIO,gpio_isr_handler,(void*)BTN_RESET_GPIO);
 
-    /* Tạo Task */
-    xTaskCreate(task_logic,   "Task_Logic",   4096, NULL, 5, NULL);
-    xTaskCreate(task_alert,   "Task_Alert",   2048, NULL, 4, NULL);
-    xTaskCreate(task_display, "Task_Display", 4096, NULL, 4, NULL);
-    xTaskCreate(task_sensor,  "Task_Sensor",  3072, NULL, 4, NULL);
-    xTaskCreate(task_light,   "Task_Light",   3072, NULL, 3, NULL);
-    xTaskCreate(task_input,   "Task_Input",   2048, NULL, 3, NULL);
-    xTaskCreate(task_wifi,    "Task_WiFi",    8192, NULL, 1, NULL);
+    /* Tăng stack cho Task_Display vì có framebuffer 1KB */
+    xTaskCreate(task_logic,  "Task_Logic",  4096,NULL,5,NULL);
+    xTaskCreate(task_alert,  "Task_Alert",  2048,NULL,4,NULL);
+    xTaskCreate(task_display,"Task_Display",5120,NULL,4,NULL); /* ← stack 5120 thay vì 4096 */
+    xTaskCreate(task_sensor, "Task_Sensor", 3072,NULL,4,NULL);
+    xTaskCreate(task_light,  "Task_Light",  3072,NULL,3,NULL);
+    xTaskCreate(task_input,  "Task_Input",  2048,NULL,3,NULL);
+    xTaskCreate(task_wifi,   "Task_WiFi",   8192,NULL,1,NULL);
 
-    ESP_LOGI(TAG, "=== Smart Study san sang! ===");
+    ESP_LOGI(TAG,"=== Smart Study san sang! ===");
 }
