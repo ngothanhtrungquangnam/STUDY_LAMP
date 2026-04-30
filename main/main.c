@@ -48,7 +48,7 @@ static const char *TAG = "SMART_STUDY";
 
 static volatile uint32_t g_work_min  = 25;
 static volatile uint32_t g_break_min = 5;
-
+static uint8_t g_last_date = 0;
 #define BCD2DEC(v)  ((((v) >> 4) & 0x0F) * 10 + ((v) & 0x0F))
 #define DEC2BCD(v)  ((((v) / 10) << 4)   | ((v) % 10))
 
@@ -556,7 +556,7 @@ static void led_set_color(uint8_t r, uint8_t g, uint8_t b, uint8_t brt_pct) {
 static void led_flash_alert(void) {
     if(!led_strip)return;
     for(int i=0;i<3;i++){
-        for(int j=0;j<LED_COUNT;j++) led_strip_set_pixel(led_strip,j,255,255,255);
+       for(int j=0;j<LED_COUNT;j++) led_strip_set_pixel(led_strip,j,20,20,20); 
         led_strip_refresh(led_strip); vTaskDelay(pdMS_TO_TICKS(200));
         led_strip_clear(led_strip);   led_strip_refresh(led_strip); vTaskDelay(pdMS_TO_TICKS(200));
     }
@@ -626,20 +626,14 @@ void task_sensor(void *pv) {
 /* ============================================================
  *  NVS MEMORY (LƯU TRỮ DỮ LIỆU CHỐNG MẤT ĐIỆN)
  * ============================================================ */
-/* ============================================================
- *  NVS MEMORY (LƯU TRỮ DỮ LIỆU CHỐNG MẤT ĐIỆN)
- * ============================================================ */
 static void save_study_data(void) {
     nvs_handle_t my_handle;
     if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
-        // Ghi dữ liệu thời gian học
         nvs_set_u32(my_handle, "total_sec", g_total_sec);
         nvs_set_u16(my_handle, "sessions", g_sessions);
-        
-        // Ghi thêm thông số cài đặt Pomodoro từ Web
         nvs_set_u32(my_handle, "work_min", g_work_min);
         nvs_set_u32(my_handle, "break_min", g_break_min);
-        
+        nvs_set_u8(my_handle, "last_date", g_last_date); // LƯU THÊM NGÀY
         nvs_commit(my_handle); 
         nvs_close(my_handle);
     }
@@ -648,25 +642,18 @@ static void save_study_data(void) {
 static void load_study_data(void) {
     nvs_handle_t my_handle;
     if (nvs_open("storage", NVS_READONLY, &my_handle) == ESP_OK) {
-        uint32_t temp_sec = 0;
-        uint16_t temp_ses = 0;
-        uint32_t temp_work = 25; // Giá trị dự phòng nếu chưa cài đặt
-        uint32_t temp_break = 5; 
+        uint32_t temp_sec = 0; uint16_t temp_ses = 0;
+        uint32_t temp_work = 25; uint32_t temp_break = 5;
+        uint8_t temp_date = 0;
         
-        // Đọc dữ liệu ra
         if (nvs_get_u32(my_handle, "total_sec", &temp_sec) == ESP_OK) g_total_sec = temp_sec;
         if (nvs_get_u16(my_handle, "sessions", &temp_ses) == ESP_OK)  g_sessions = temp_ses;
-        
-        // Đọc thông số Pomodoro đã lưu
         if (nvs_get_u32(my_handle, "work_min", &temp_work) == ESP_OK) g_work_min = temp_work;
         if (nvs_get_u32(my_handle, "break_min", &temp_break) == ESP_OK) g_break_min = temp_break;
-
+        if (nvs_get_u8(my_handle, "last_date", &temp_date) == ESP_OK) g_last_date = temp_date; // ĐỌC NGÀY LÊN
         nvs_close(my_handle);
-        ESP_LOGI(TAG, "Da load: Hoc %lu giay, Work: %lu phut, Break: %lu phut", 
-                 g_total_sec, g_work_min, g_break_min);
     }
 }
-
 /* ============================================================
  *  TASK 3: Task_Logic
  * ============================================================ */
@@ -701,7 +688,7 @@ void task_logic(void *pv) {
                     break;
                 case CMD_RESET:
                     state=STATE_IDLE; remain_sec=0;
-                    g_sessions=0; g_total_sec=0; g_manual_color=false;
+                     g_manual_color=false;
                     save_study_data();
                      break;
             }
@@ -709,6 +696,14 @@ void task_logic(void *pv) {
 
         /* Web */
         if(xQueueReceive(Queue_WebCtrl,&wctrl,0)==pdTRUE){
+            // --- THÊM ĐOẠN CODE NÀY ĐỂ KÍCH HOẠT CÒI ---
+            // Nếu lệnh từ Web là Start, Stop hoặc Reset thì cho còi kêu 1 tiếng "bíp" ngắn
+            if (wctrl.cmd == WEB_CMD_START || wctrl.cmd == WEB_CMD_STOP || wctrl.cmd == WEB_CMD_RESET) {
+                gpio_set_level(BUZZER_GPIO, 1); 
+                vTaskDelay(pdMS_TO_TICKS(80)); // Kêu trong 80ms
+                gpio_set_level(BUZZER_GPIO, 0);
+            }
+            // ------------------------------------------
             switch(wctrl.cmd){
                 case WEB_CMD_START:
                     if(state==STATE_IDLE||state==STATE_BREAK){
@@ -724,7 +719,9 @@ void task_logic(void *pv) {
                     break;
                 case WEB_CMD_RESET:
                     state=STATE_IDLE; remain_sec=0;
-                    g_sessions=0; g_total_sec=0; g_manual_color=false; break;
+                    g_manual_color=false; 
+                    save_study_data();
+                    break;
                 case WEB_CMD_COLOR:
                     g_manual_color=true;
                     g_manual_r=wctrl.r; g_manual_g=wctrl.g; g_manual_b=wctrl.b; break;
@@ -780,6 +777,21 @@ void task_logic(void *pv) {
         }
         if(xSemaphoreTake(Mutex_I2C,pdMS_TO_TICKS(20))==pdTRUE){
             ds3231_read_time(&local_time); g_rtc_time=local_time; xSemaphoreGive(Mutex_I2C);
+            /* === BỘ DÒ NỬA ĐÊM TỰ RESET === */
+        if (local_time.year > 0) { // Đảm bảo đã đọc được giờ thật
+            if (g_last_date == 0) {
+                // Lần đầu cấp điện, lưu ngày hiện tại làm mốc
+                g_last_date = local_time.date;
+                save_study_data();
+            } else if (local_time.date != g_last_date) {
+                // ĐÃ QUA NGÀY MỚI! Tiến hành xóa thành tích
+                g_total_sec = 0;
+                g_sessions = 0;
+                g_last_date = local_time.date; 
+                save_study_data();
+                ESP_LOGI(TAG, "Da qua nua dem! Reset Total ve 0");
+            }
+        }
         }
 
         /* LED màu */
@@ -931,7 +943,7 @@ void task_wifi(void *pv){
 
     wifi_data_t wdata;
     while(1){
-        vTaskDelay(pdMS_TO_TICKS(1000));
+       vTaskDelay(pdMS_TO_TICKS(500));
         if(!mqtt_connected) continue;
         if(xQueuePeek(Queue_WiFi,&wdata,0)==pdTRUE){
             uint8_t lr=0,lg=0,lb=0;
