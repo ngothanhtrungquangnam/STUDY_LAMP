@@ -23,6 +23,7 @@
 #include "nvs.h"
 #include "esp_netif.h"
 #include "mqtt_client.h"
+#include "freertos/timers.h"
 static const char *TAG = "SMART_STUDY";
 
 #define BTN_START_GPIO      4
@@ -42,8 +43,8 @@ static const char *TAG = "SMART_STUDY";
 #define I2C_MASTER_FREQ_HZ  100000
 #define I2C_TIMEOUT_MS      pdMS_TO_TICKS(1000)
 
-#define WIFI_SSID           "Van Lan"
-#define WIFI_PASS           "23091969"
+#define WIFI_SSID           "MU VO DICH"
+#define WIFI_PASS           "12344321"
 #define SERVER_URL          "https://web-study-lamp.onrender.com"
 
 static volatile uint32_t g_work_min  = 25;
@@ -52,7 +53,7 @@ static uint8_t g_last_date = 0;
 #define BCD2DEC(v)  ((((v) >> 4) & 0x0F) * 10 + ((v) & 0x0F))
 #define DEC2BCD(v)  ((((v) / 10) << 4)   | ((v) % 10))
 
-typedef enum { CMD_START, CMD_STOP, CMD_RESET } btn_cmd_t;
+typedef enum { CMD_START, CMD_STOP, CMD_RESET, CMD_TICK } btn_cmd_t;
 typedef enum { STATE_IDLE, STATE_WORK, STATE_BREAK, STATE_PAUSE } clock_state_t;
 typedef enum { ALERT_NONE, ALERT_WORK_END, ALERT_BREAK_START } alert_code_t;
 
@@ -667,7 +668,7 @@ void task_logic(void *pv) {
     btn_cmd_t cmd;
     web_ctrl_t wctrl;
     float lux_val=0.0f;
-    TickType_t last_sec_tick=xTaskGetTickCount();
+   
 
     while(1){
         /* Nút nhấn */
@@ -691,6 +692,28 @@ void task_logic(void *pv) {
                      g_manual_color=false;
                     save_study_data();
                      break;
+                case CMD_TICK:
+                    if((state==STATE_WORK||state==STATE_BREAK)&&remain_sec>0){
+                        remain_sec--;
+                        if(state==STATE_WORK) {
+                            g_total_sec++;
+                            // Lưu mỗi 60s
+                            if (g_total_sec % 60 == 0) save_study_data();
+                        }
+                    }
+                    if(remain_sec==0&&(state==STATE_WORK||state==STATE_BREAK)){
+                        if(state==STATE_WORK){
+                            pending_alert=ALERT_WORK_END; g_sessions++;
+                            state=STATE_BREAK; remain_sec=g_break_min*60;
+                        } else {
+                            pending_alert=ALERT_BREAK_START;
+                            state=STATE_IDLE; remain_sec=0;
+                        }
+                        g_alert_code=pending_alert; xSemaphoreGive(Sem_Alert);
+                        save_study_data();
+                    }
+                    break;
+                /* ======================================================== */
             }
         }
 
@@ -748,29 +771,7 @@ void task_logic(void *pv) {
             led_brt=(uint8_t)(100.0f-clamped*70.0f/1000.0f);
         }
 
-        /* Đếm ngược */
-        TickType_t now=xTaskGetTickCount();
-        if((now-last_sec_tick)>=pdMS_TO_TICKS(1000)){
-            last_sec_tick=now;
-            if((state==STATE_WORK||state==STATE_BREAK)&&remain_sec>0){
-                remain_sec--;
-                if(state==STATE_WORK) g_total_sec++;
-                if (g_total_sec % 60 == 0) {
-                        save_study_data();
-                    }
-            }
-            if(remain_sec==0&&(state==STATE_WORK||state==STATE_BREAK)){
-                if(state==STATE_WORK){
-                    pending_alert=ALERT_WORK_END; g_sessions++;
-                    state=STATE_BREAK; remain_sec=g_break_min*60;
-                } else {
-                    pending_alert=ALERT_BREAK_START;
-                    state=STATE_IDLE; remain_sec=0;
-                }
-                g_alert_code=pending_alert; xSemaphoreGive(Sem_Alert);
-                save_study_data();
-            }
-        }
+      
 
         if(xSemaphoreTake(Mutex_State,pdMS_TO_TICKS(10))==pdTRUE){
             g_state=state; g_remain_sec=remain_sec; xSemaphoreGive(Mutex_State);
@@ -976,6 +977,16 @@ void task_wifi(void *pv){
 }
 
 /* ============================================================
+ *  SOFTWARE TIMER CALLBACK (Chạy mỗi 1000ms)
+ * ============================================================ */
+static void timer_1sec_callback(TimerHandle_t xTimer) {
+    btn_cmd_t cmd = CMD_TICK;
+    // Gửi lệnh "nhịp đập 1 giây" vào hàng đợi Command
+    // Không dùng FromISR vì callback này chạy ở Timer Daemon Task, không phải Ngắt phần cứng
+    xQueueSend(Queue_Command, &cmd, 0); 
+}
+
+/* ============================================================
  *  APP_MAIN
  * ============================================================ */
 void app_main(void) {
@@ -987,7 +998,7 @@ void app_main(void) {
 
 #define SET_RTC_TIME 0
 #if SET_RTC_TIME
-    rtc_time_t setup_time={.sec=0,.min=05,.hour=22,.day=1,.date=30,.month=4,.year=26};
+    rtc_time_t setup_time={.sec=0,.min=56,.hour=18,.day=1,.date=4,.month=5,.year=26};
     if(ds3231_set_time(&setup_time)==ESP_OK)
         ESP_LOGI("RTC","Set gio OK! Doi SET_RTC_TIME=0 roi flash lai");
     while(1) vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1023,6 +1034,13 @@ void app_main(void) {
     Mutex_I2C  =xSemaphoreCreateMutex();
     Mutex_State=xSemaphoreCreateMutex();
     Sem_Alert  =xSemaphoreCreateBinary();
+
+    // Tạo timer: Tên "Timer1s", Chu kỳ 1000ms, Auto-reload (pdTRUE), ID 0, Hàm Callback
+    TimerHandle_t Timer_1Sec = xTimerCreate("Timer1s", pdMS_TO_TICKS(1000), pdTRUE, (void *)0, timer_1sec_callback);
+    if (Timer_1Sec != NULL) {
+        xTimerStart(Timer_1Sec, 0); // Bắt đầu cho Timer chạy
+    }
+    /* =================================== */
 
     gpio_install_isr_service(0);
     gpio_isr_handler_add(BTN_START_GPIO,gpio_isr_handler,(void*)BTN_START_GPIO);
