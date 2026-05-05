@@ -186,12 +186,9 @@ static void oled_set_brightness(uint8_t level) {
 
 /* ============================================================
  *  ██████████████████████████████████████████████████████████
- *  FRAMEBUFFER + LOPAKA DISPLAY ENGINE  ← THÊM MỚI HOÀN TOÀN
+ *  FRAMEBUFFER + LOPAKA DISPLAY ENGINE  
  *  ██████████████████████████████████████████████████████████
- *
- *  Đây là phần DUY NHẤT thay đổi so với firmware gốc của bạn.
- *  Tất cả code bên dưới đây đến hết task_display() là MỚI.
- * ============================================================ */
+
 
 /* Framebuffer 128×64 pixel trong RAM */
 static uint8_t fb[8][128];
